@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import '../utils/constants.dart';
+import 'foreground_service.dart';
 
 /// BLE Service for managing Bluetooth Low Energy connections
 class BleService {
@@ -14,10 +15,20 @@ class BleService {
   BluetoothCharacteristic? _txCharacteristic; // ESP32 -> App
   BluetoothCharacteristic? _rxCharacteristic; // App -> ESP32
 
+  // Connection state subscription
+  StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
+
+  // Characteristic data subscription
+  StreamSubscription<List<int>>? _characteristicSubscription;
+
   // Connection state
   final _connectionStateController = StreamController<bool>.broadcast();
   Stream<bool> get connectionState => _connectionStateController.stream;
-  bool get isConnected => _connectedDevice != null;
+  bool get isConnected {
+    final connected = _connectedDevice != null;
+    print('BleService.isConnected getter called: $connected (device: $_connectedDevice)');
+    return connected;
+  }
 
   // Data stream from device
   final _dataStreamController = StreamController<String>.broadcast();
@@ -99,11 +110,19 @@ class BleService {
       }
 
       // Connect to device
-      await device.connect(timeout: BleConstants.connectionTimeout);
+      // Note: Cannot use autoConnect because ESP32 initiates MTU changes
+      // Connection will be maintained by not calling disconnect() when app backgrounds
+      await device.connect(
+        timeout: BleConstants.connectionTimeout,
+      );
       _connectedDevice = device;
 
+      // Cancel any existing connection state subscription
+      await _connectionStateSubscription?.cancel();
+
       // Listen to connection state
-      device.connectionState.listen((state) {
+      _connectionStateSubscription = device.connectionState.listen((state) {
+        print('BleService: Connection state changed to $state');
         if (state == BluetoothConnectionState.disconnected) {
           _handleDisconnection();
         }
@@ -128,9 +147,12 @@ class BleService {
             if (charUuid == BleUuids.txCharacteristicUuid.toUpperCase()) {
               _txCharacteristic = characteristic;
 
+              // Cancel any existing characteristic subscription
+              await _characteristicSubscription?.cancel();
+
               // Subscribe to notifications
               await characteristic.setNotifyValue(true);
-              characteristic.lastValueStream.listen((value) {
+              _characteristicSubscription = characteristic.lastValueStream.listen((value) {
                 if (value.isNotEmpty) {
                   String data = String.fromCharCodes(value);
                   _dataStreamController.add(data);
@@ -148,6 +170,8 @@ class BleService {
 
       // Check if we found the required characteristics
       if (foundUartService && _txCharacteristic != null && _rxCharacteristic != null) {
+        // Start foreground notification to keep connection alive in background
+        await ForegroundService.start();
         _connectionStateController.add(true);
         return true;
       } else {
@@ -170,6 +194,14 @@ class BleService {
   /// Disconnect from current device
   Future<void> disconnect() async {
     try {
+      // Cancel connection state subscription
+      await _connectionStateSubscription?.cancel();
+      _connectionStateSubscription = null;
+
+      // Cancel characteristic data subscription
+      await _characteristicSubscription?.cancel();
+      _characteristicSubscription = null;
+
       if (_connectedDevice != null) {
         await _connectedDevice!.disconnect();
         _handleDisconnection();
@@ -181,10 +213,15 @@ class BleService {
 
   /// Handle disconnection
   void _handleDisconnection() {
+    print('BleService._handleDisconnection() called!');
+    print('  Stack trace: ${StackTrace.current}');
     _connectedDevice = null;
     _txCharacteristic = null;
     _rxCharacteristic = null;
     _connectionStateController.add(false);
+
+    // Stop foreground notification when disconnected
+    ForegroundService.stop();
   }
 
   /// Send data to connected device
@@ -212,6 +249,8 @@ class BleService {
 
   /// Dispose streams
   void dispose() {
+    _connectionStateSubscription?.cancel();
+    _characteristicSubscription?.cancel();
     _connectionStateController.close();
     _dataStreamController.close();
     _scanResultsController.close();

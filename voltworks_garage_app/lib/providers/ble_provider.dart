@@ -29,13 +29,19 @@ class BleProvider extends ChangeNotifier {
 
   /// Initialize provider and listen to streams
   void _init() {
+    // Initialize with current connection state (important when provider is recreated)
+    _isConnected = _bleService.isConnected;
+    if (_isConnected) {
+      _connectedDeviceName = _bleService.getDeviceName();
+    }
+
     // Listen to scan results
     _bleService.scanResults.listen((results) {
       _scanResults = results;
       notifyListeners();
     });
 
-    // Listen to connection state
+    // Listen to connection state changes
     _bleService.connectionState.listen((connected) {
       _isConnected = connected;
       if (connected) {
@@ -180,7 +186,8 @@ class BleProvider extends ChangeNotifier {
 
   @override
   void dispose() {
-    _bleService.dispose();
+    // Don't dispose the BleService singleton - it should persist
+    // Only dispose this provider's resources
     super.dispose();
   }
 }
