@@ -2,10 +2,17 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'providers/ble_provider.dart';
 import 'screens/home_screen.dart';
+import 'services/foreground_service.dart';
 import 'utils/app_theme.dart';
 import 'utils/constants.dart';
 
-void main() {
+void main() async {
+  // Ensure Flutter bindings are initialized
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize foreground service for Android
+  await ForegroundService.initialize();
+
   runApp(const VoltworksGarageApp());
 }
 

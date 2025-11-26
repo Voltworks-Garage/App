@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -6,6 +7,12 @@ import '../services/ble_service.dart';
 /// Provider for managing BLE state
 class BleProvider extends ChangeNotifier {
   final BleService _bleService = BleService();
+
+  // Stream subscriptions
+  StreamSubscription? _scanResultsSub;
+  StreamSubscription? _connectionStateSub;
+  StreamSubscription? _dataStreamSub;
+  StreamSubscription? _errorsSub;
 
   // State
   bool _isScanning = false;
@@ -18,6 +25,7 @@ class BleProvider extends ChangeNotifier {
   // Getters
   bool get isScanning => _isScanning;
   bool get isConnected => _isConnected;
+  bool get isReconnecting => _bleService.isReconnecting && !_isConnected;
   List<ScanResult> get scanResults => _scanResults;
   String? get connectedDeviceName => _connectedDeviceName;
   String? get lastError => _lastError;
@@ -36,13 +44,13 @@ class BleProvider extends ChangeNotifier {
     }
 
     // Listen to scan results
-    _bleService.scanResults.listen((results) {
+    _scanResultsSub = _bleService.scanResults.listen((results) {
       _scanResults = results;
       notifyListeners();
     });
 
     // Listen to connection state changes
-    _bleService.connectionState.listen((connected) {
+    _connectionStateSub = _bleService.connectionState.listen((connected) {
       _isConnected = connected;
       if (connected) {
         _connectedDeviceName = _bleService.getDeviceName();
@@ -54,7 +62,7 @@ class BleProvider extends ChangeNotifier {
     });
 
     // Listen to data stream
-    _bleService.dataStream.listen((data) {
+    _dataStreamSub = _bleService.dataStream.listen((data) {
       print('Received from device: $data');
 
       // Add timestamp to message
@@ -67,7 +75,7 @@ class BleProvider extends ChangeNotifier {
     });
 
     // Listen to errors
-    _bleService.errors.listen((error) {
+    _errorsSub = _bleService.errors.listen((error) {
       print('BLE Error: $error');
       _lastError = error;
       notifyListeners();
@@ -186,6 +194,12 @@ class BleProvider extends ChangeNotifier {
 
   @override
   void dispose() {
+    // Cancel all stream subscriptions
+    _scanResultsSub?.cancel();
+    _connectionStateSub?.cancel();
+    _dataStreamSub?.cancel();
+    _errorsSub?.cancel();
+
     // Don't dispose the BleService singleton - it should persist
     // Only dispose this provider's resources
     super.dispose();

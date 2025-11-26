@@ -1,0 +1,3 @@
+[submodule "voltworks_garage_app/lib/models/schema/ble-protocol-schema"]
+	path = voltworks_garage_app/lib/models/schema/ble-protocol-schema
+	url = https://github.com/Voltworks-Garage/ble-protocol-schema.git

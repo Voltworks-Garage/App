@@ -51,9 +51,21 @@ class _HomeScreenState extends State<HomeScreen> {
                   },
                   tooltip: 'Disconnect',
                 ),
+              if (bleProvider.isReconnecting)
+                const Padding(
+                  padding: EdgeInsets.all(16.0),
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      valueColor: AlwaysStoppedAnimation<Color>(AppColors.warning),
+                    ),
+                  ),
+                ),
             ],
           ),
-          body: bleProvider.isConnected
+          body: (bleProvider.isConnected || bleProvider.isReconnecting)
               ? _buildConnectedView(context, bleProvider)
               : _buildDisconnectedView(context, bleProvider),
         );
@@ -208,14 +220,14 @@ class _HomeScreenState extends State<HomeScreen> {
           color: AppColors.surface,
           child: Column(
             children: [
-              const Icon(
-                Icons.check_circle,
-                color: AppColors.success,
+              Icon(
+                bleProvider.isReconnecting ? Icons.sync : Icons.check_circle,
+                color: bleProvider.isReconnecting ? AppColors.warning : AppColors.success,
                 size: 48,
               ),
               const SizedBox(height: AppLayout.paddingMedium),
               Text(
-                'Connected to',
+                bleProvider.isReconnecting ? 'Reconnecting to' : 'Connected to',
                 style: AppTextStyles.bodySmall.copyWith(
                   color: AppColors.textSecondary,
                 ),

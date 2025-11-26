@@ -44,6 +44,9 @@ dependencies:
   # Permissions handling
   permission_handler: ^11.3.1
 
+  # Foreground service for Android
+  flutter_foreground_task: ^8.11.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

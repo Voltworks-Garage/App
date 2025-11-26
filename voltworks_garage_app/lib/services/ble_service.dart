@@ -1,259 +1,318 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import '../utils/constants.dart';
 import 'foreground_service.dart';
 
-/// BLE Service for managing Bluetooth Low Energy connections
+/// Minimal BLE Service - just connect and subscribe to TX/RX
 class BleService {
   // Singleton pattern
   static final BleService _instance = BleService._internal();
   factory BleService() => _instance;
   BleService._internal();
 
-  // Current connected device
   BluetoothDevice? _connectedDevice;
-  BluetoothCharacteristic? _txCharacteristic; // ESP32 -> App
-  BluetoothCharacteristic? _rxCharacteristic; // App -> ESP32
+  StreamSubscription<List<int>>? _rxSubscription;
+  StreamSubscription<BluetoothConnectionState>? _deviceStateSubscription;
+  bool _userDisconnected = false; // Track if disconnect was intentional
+  Timer? _reconnectTimeoutTimer; // Timer to give up on reconnection
+  BleWriter? _bleWriter; // Writer instance for handling queued writes
 
-  // Connection state subscription
-  StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
-
-  // Characteristic data subscription
-  StreamSubscription<List<int>>? _characteristicSubscription;
-
-  // Connection state
+  // Streams
   final _connectionStateController = StreamController<bool>.broadcast();
   Stream<bool> get connectionState => _connectionStateController.stream;
-  bool get isConnected {
-    final connected = _connectedDevice != null;
-    print('BleService.isConnected getter called: $connected (device: $_connectedDevice)');
-    return connected;
-  }
+  bool get isConnected => _connectedDevice != null;
 
-  // Data stream from device
+  // Reconnecting state: device exists but not connected, and wasn't user-initiated disconnect
+  bool get isReconnecting => _connectedDevice != null && !_userDisconnected;
+
   final _dataStreamController = StreamController<String>.broadcast();
   Stream<String> get dataStream => _dataStreamController.stream;
 
-  // Scan results
   final _scanResultsController = StreamController<List<ScanResult>>.broadcast();
   Stream<List<ScanResult>> get scanResults => _scanResultsController.stream;
-  final List<ScanResult> _discoveredDevices = [];
 
-  // Error messages
   final _errorController = StreamController<String>.broadcast();
   Stream<String> get errors => _errorController.stream;
 
-  /// Check if Bluetooth is available and enabled
+  /// Check if Bluetooth is available
   Future<bool> isBluetoothAvailable() async {
-    try {
-      if (await FlutterBluePlus.isSupported == false) {
-        _errorController.add('Bluetooth is not supported on this device');
-        return false;
-      }
-
-      // Check if adapter is on
-      var state = await FlutterBluePlus.adapterState.first;
-      if (state != BluetoothAdapterState.on) {
-        _errorController.add('Bluetooth is turned off. Please enable Bluetooth.');
-        return false;
-      }
-
-      return true;
-    } catch (e) {
-      _errorController.add('Error checking Bluetooth: $e');
+    if (await FlutterBluePlus.isSupported == false) {
+      _errorController.add('Bluetooth not supported');
       return false;
     }
+    var state = await FlutterBluePlus.adapterState.first;
+    if (state != BluetoothAdapterState.on) {
+      _errorController.add('Bluetooth is off');
+      return false;
+    }
+    return true;
   }
 
-  /// Start scanning for BLE devices (shows ALL devices)
+  /// Start scan
   Future<void> startScan() async {
-    try {
-      // Check Bluetooth availability
-      if (!await isBluetoothAvailable()) {
-        return;
-      }
+    if (!await isBluetoothAvailable()) return;
 
-      // Clear previous results
-      _discoveredDevices.clear();
+    FlutterBluePlus.scanResults.listen((results) {
+      _scanResultsController.add(results);
+    });
 
-      // Listen to scan results
-      FlutterBluePlus.scanResults.listen((results) {
-        _discoveredDevices.clear();
-        _discoveredDevices.addAll(results);
-        _scanResultsController.add(List.from(_discoveredDevices));
-      });
-
-      // Start scanning - no filters, show everything
-      await FlutterBluePlus.startScan(
-        timeout: BleConstants.scanDuration,
-      );
-    } catch (e) {
-      _errorController.add('Error starting scan: $e');
-    }
+    await FlutterBluePlus.startScan(timeout: BleConstants.scanDuration);
   }
 
-  /// Stop scanning
+  /// Stop scan
   Future<void> stopScan() async {
-    try {
-      await FlutterBluePlus.stopScan();
-    } catch (e) {
-      _errorController.add('Error stopping scan: $e');
-    }
+    await FlutterBluePlus.stopScan();
   }
 
-  /// Connect to a BLE device
+  /// Connect to device
   Future<bool> connect(BluetoothDevice device) async {
     try {
-      // Disconnect from any existing device
+      // Disconnect any existing device
       if (_connectedDevice != null) {
         await disconnect();
       }
 
-      // Connect to device
-      // Note: Cannot use autoConnect because ESP32 initiates MTU changes
-      // Connection will be maintained by not calling disconnect() when app backgrounds
-      await device.connect(
-        timeout: BleConstants.connectionTimeout,
-      );
+      // Mark as not user-disconnected (we're initiating a connection)
+      _userDisconnected = false;
+
+      // Cancel any existing reconnect timer from previous connections
+      _cancelReconnectTimeout();
+
+      // Connect with autoConnect for automatic reconnection
+      // mtu: null is required when using autoConnect
+      await device.connect(autoConnect: true, mtu: null);
       _connectedDevice = device;
 
-      // Cancel any existing connection state subscription
-      await _connectionStateSubscription?.cancel();
+      // Wait for actual connection (autoConnect returns immediately)
+      await device.connectionState
+          .where((state) => state == BluetoothConnectionState.connected)
+          .first;
 
-      // Listen to connection state
-      _connectionStateSubscription = device.connectionState.listen((state) {
-        print('BleService: Connection state changed to $state');
+      // Listen to device connection state changes
+      _deviceStateSubscription?.cancel();
+      _deviceStateSubscription = device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
-          _handleDisconnection();
+          _connectionStateController.add(false);
+          // Start reconnect timeout timer when disconnected ungracefully
+          if (!_userDisconnected) {
+            _startReconnectTimeout();
+          }
+        } else if (state == BluetoothConnectionState.connected) {
+          _connectionStateController.add(true);
+          // Cancel timeout timer on successful reconnection
+          _cancelReconnectTimeout();
         }
       });
 
       // Discover services
       List<BluetoothService> services = await device.discoverServices();
 
-      // Find UART service and characteristics
-      bool foundUartService = false;
-
+      // Find UART service
       for (var service in services) {
-        // Check if this is the UART service
-        if (service.uuid.toString().toUpperCase() ==
-            BleUuids.uartServiceUuid.toUpperCase()) {
-          foundUartService = true;
+        if (service.uuid.toString().toUpperCase() == BleUuids.uartServiceUuid.toUpperCase()) {
 
-          for (var characteristic in service.characteristics) {
-            String charUuid = characteristic.uuid.toString().toUpperCase();
+          for (var char in service.characteristics) {
+            String uuid = char.uuid.toString().toUpperCase();
 
-            // TX Characteristic (receive data from ESP32)
-            if (charUuid == BleUuids.txCharacteristicUuid.toUpperCase()) {
-              _txCharacteristic = characteristic;
-
-              // Cancel any existing characteristic subscription
-              await _characteristicSubscription?.cancel();
-
-              // Subscribe to notifications
-              await characteristic.setNotifyValue(true);
-              _characteristicSubscription = characteristic.lastValueStream.listen((value) {
+            // TX characteristic (ESP32 -> App)
+            if (uuid == BleUuids.txCharacteristicUuid.toUpperCase()) {
+              await char.setNotifyValue(true);
+              _rxSubscription = char.lastValueStream.listen((value) {
                 if (value.isNotEmpty) {
-                  String data = String.fromCharCodes(value);
-                  _dataStreamController.add(data);
+                  _dataStreamController.add(String.fromCharCodes(value));
                 }
               });
-            }
-
-            // RX Characteristic (send data to ESP32)
-            if (charUuid == BleUuids.rxCharacteristicUuid.toUpperCase()) {
-              _rxCharacteristic = characteristic;
             }
           }
         }
       }
 
-      // Check if we found the required characteristics
-      if (foundUartService && _txCharacteristic != null && _rxCharacteristic != null) {
-        // Start foreground notification to keep connection alive in background
-        await ForegroundService.start();
-        _connectionStateController.add(true);
-        return true;
-      } else {
-        // UART service not found, disconnect
-        if (!foundUartService) {
-          _errorController.add('Device does not support UART service. Not a compatible device.');
-        } else {
-          _errorController.add('UART service found but characteristics missing.');
-        }
-        await disconnect();
-        return false;
-      }
-    } catch (e) {
-      _errorController.add('Error connecting to device: $e');
-      await disconnect();
-      return false;
-    }
-  }
+      _connectionStateController.add(true);
 
-  /// Disconnect from current device
-  Future<void> disconnect() async {
-    try {
-      // Cancel connection state subscription
-      await _connectionStateSubscription?.cancel();
-      _connectionStateSubscription = null;
+      // Initialize BLE writer for this device
+      _bleWriter = BleWriter(device);
 
-      // Cancel characteristic data subscription
-      await _characteristicSubscription?.cancel();
-      _characteristicSubscription = null;
+      // Start foreground service to keep connection alive
+      await ForegroundService.start();
 
-      if (_connectedDevice != null) {
-        await _connectedDevice!.disconnect();
-        _handleDisconnection();
-      }
-    } catch (e) {
-      _errorController.add('Error disconnecting: $e');
-    }
-  }
-
-  /// Handle disconnection
-  void _handleDisconnection() {
-    print('BleService._handleDisconnection() called!');
-    print('  Stack trace: ${StackTrace.current}');
-    _connectedDevice = null;
-    _txCharacteristic = null;
-    _rxCharacteristic = null;
-    _connectionStateController.add(false);
-
-    // Stop foreground notification when disconnected
-    ForegroundService.stop();
-  }
-
-  /// Send data to connected device
-  Future<bool> sendData(String data) async {
-    try {
-      if (_rxCharacteristic == null) {
-        _errorController.add('Not connected to a device');
-        return false;
-      }
-
-      // Convert string to bytes and send
-      List<int> bytes = data.codeUnits;
-      await _rxCharacteristic!.write(bytes, withoutResponse: false);
       return true;
     } catch (e) {
-      _errorController.add('Error sending data: $e');
+      _errorController.add('Connection error: $e');
+      _connectedDevice = null;
       return false;
     }
   }
 
-  /// Get connected device name
-  String? getDeviceName() {
-    return _connectedDevice?.platformName;
+  /// Disconnect
+  Future<void> disconnect() async {
+    // Mark as user-initiated disconnect
+    _userDisconnected = true;
+
+    // Cancel reconnect timeout timer
+    _cancelReconnectTimeout();
+
+    await _rxSubscription?.cancel();
+    await _deviceStateSubscription?.cancel();
+
+    // Dispose BLE writer
+    _bleWriter?.dispose();
+    _bleWriter = null;
+
+    if (_connectedDevice != null) {
+      await _connectedDevice!.disconnect();
+      _connectedDevice = null;
+      _connectionStateController.add(false);
+
+      // Stop foreground service
+      await ForegroundService.stop();
+    }
   }
 
-  /// Dispose streams
+  /// Send binary data (Uint8List) - primary method for protocol messages
+  Future<bool> sendBytes(Uint8List data) async {
+    if (_bleWriter == null) {
+      _errorController.add('Not connected');
+      return false;
+    }
+
+    try {
+      return await _bleWriter!.sendBytes(data);
+    } catch (e) {
+      _errorController.add('Send error: $e');
+      return false;
+    }
+  }
+
+  /// Send string data - for backward compatibility or text-based commands
+  Future<bool> sendData(String data) async {
+    if (_bleWriter == null) {
+      _errorController.add('Not connected');
+      return false;
+    }
+
+    try {
+      return await _bleWriter!.sendData(data);
+    } catch (e) {
+      _errorController.add('Send error: $e');
+      return false;
+    }
+  }
+
+  String? getDeviceName() => _connectedDevice?.platformName;
+
+  /// Start reconnect timeout timer
+  void _startReconnectTimeout() {
+    _cancelReconnectTimeout(); // Cancel any existing timer
+    _reconnectTimeoutTimer = Timer(BleConstants.reconnectTimeout, () {
+      // Timeout reached - give up and disconnect
+      print('BleService: Reconnect timeout reached, giving up');
+      disconnect();
+    });
+  }
+
+  /// Cancel reconnect timeout timer
+  void _cancelReconnectTimeout() {
+    _reconnectTimeoutTimer?.cancel();
+    _reconnectTimeoutTimer = null;
+  }
+
   void dispose() {
-    _connectionStateSubscription?.cancel();
-    _characteristicSubscription?.cancel();
+    _rxSubscription?.cancel();
+    _deviceStateSubscription?.cancel();
+    _reconnectTimeoutTimer?.cancel();
+    _bleWriter?.dispose();
     _connectionStateController.close();
     _dataStreamController.close();
     _scanResultsController.close();
     _errorController.close();
+  }
+}
+
+/// BLE Writer class - handles queued writes with MTU-aware chunking
+class BleWriter {
+  final BluetoothDevice device;
+  BluetoothCharacteristic? _rxChar;
+
+  final _writeQueue = StreamController<List<int>>();
+  StreamSubscription? _queueSubscription;
+  bool _writing = false;
+
+  BleWriter(this.device) {
+    _processQueue();
+  }
+
+  Future<void> _initRxChar() async {
+    if (_rxChar != null) return;
+
+    final services = await device.discoverServices();
+
+    for (var s in services) {
+      if (s.uuid.toString().toUpperCase() == BleUuids.uartServiceUuid.toUpperCase()) {
+        for (var c in s.characteristics) {
+          if (c.uuid.toString().toUpperCase() == BleUuids.rxCharacteristicUuid.toUpperCase()) {
+            _rxChar = c;
+            return;
+          }
+        }
+      }
+    }
+    throw Exception("RX characteristic not found");
+  }
+
+  /// Send binary data (Uint8List) - primary method for protocol messages
+  Future<bool> sendBytes(Uint8List data) async {
+    _writeQueue.add(data);
+    return true;
+  }
+
+  /// Send string data (for backward compatibility or text-based commands)
+  Future<bool> sendData(String data) async {
+    final bytes = utf8.encode(data);
+    _writeQueue.add(bytes);
+    return true;
+  }
+
+  void _processQueue() {
+    _queueSubscription = _writeQueue.stream.listen((bytes) async {
+      if (_writing) return;
+      _writing = true;
+
+      try {
+        await _initRxChar();
+        await _chunkAndWrite(bytes);
+      } catch (e) {
+        print("BLE write error: $e");
+      }
+
+      _writing = false;
+    });
+  }
+
+  Future<void> _chunkAndWrite(List<int> bytes) async {
+    // Dynamically read current MTU
+    int currentMtu = await device.mtu.first;
+    int maxPayload = currentMtu - 3; // BLE ATT overhead
+
+    int index = 0;
+
+    while (index < bytes.length) {
+      final end = (index + maxPayload).clamp(0, bytes.length);
+      final chunk = bytes.sublist(index, end);
+      index = end;
+
+      await _rxChar!.write(
+        chunk,
+        withoutResponse: !_rxChar!.properties.write,
+      );
+
+      await Future.delayed(const Duration(milliseconds: 5));
+    }
+  }
+
+  void dispose() {
+    _queueSubscription?.cancel();
+    _writeQueue.close();
   }
 }
